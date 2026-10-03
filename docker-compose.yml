@@ -1,0 +1,13 @@
+services:
+  subtitle-station:
+    build: .
+    image: subtitle-correction-station:latest
+    container_name: subtitle-correction-station
+    ports:
+      - "8000:8000"
+    volumes:
+      - subtitle-data:/data
+    restart: unless-stopped
+
+volumes:
+  subtitle-data:
