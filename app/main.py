@@ -172,7 +172,7 @@ async def create_project(
     } for c in parsed]
     shots_payload = [{"ord": s.ord, "start_ms": s.start_ms,
                       "end_ms": s.end_ms} for s in shots]
-    with db.get_conn() as conn:
+    with db.get_write_conn() as conn:
         pid = db.create_project(conn, name, cps_limit, min_gap_ms,
                                 tolerance_ms, cues_payload, shots_payload)
         return _recompute(conn, pid)
@@ -188,7 +188,11 @@ def get_project(pid: int):
 def update_settings(pid: int, body: SettingsIn):
     if body.cps_limit <= 0 or body.min_gap_ms < 0 or body.tolerance_ms < 0:
         raise HTTPException(400, "参数非法")
-    with db.get_conn() as conn:
+    # BEGIN IMMEDIATE 写事务：进入即持写锁。与并发的 POST adopt 串行化——
+    # 若一条采纳刚在锁外提交，下面的读取就能看到它，重核验会在同一事务内
+    # 撤销新参数下的失效采纳；若本请求先持锁，adopt 会等本事务提交后按
+    # 新参数重算并拒绝失效提案。读取、求解、重核验、落库基于同一份状态。
+    with db.get_write_conn() as conn:
         prow = db.get_project(conn, pid)
         if prow is None:
             raise HTTPException(404, "项目不存在")
@@ -205,8 +209,8 @@ def update_settings(pid: int, body: SettingsIn):
             ) for r in cue_rows
         ]
         # 同一事务内：先用新参数求提案（与详情/采纳校验完全同一套
-        # build_analysis 规则）。失败则由 get_conn 整体回滚，参数与
-        # 采纳状态都不会被改动。
+        # build_analysis 规则）。失败则由 get_write_conn 整体回滚，
+        # 参数与采纳状态都不会被改动。
         analysis = build_analysis(
             parsed, shots, body.cps_limit,
             body.min_gap_ms, body.tolerance_ms,
@@ -233,7 +237,11 @@ def update_settings(pid: int, body: SettingsIn):
 
 @app.post("/api/projects/{pid}/adopt")
 def adopt(pid: int, body: AdoptIn):
-    with db.get_conn() as conn:
+    # 与 PUT settings 共用同一把写锁：提案校验所依据的参数、字幕与
+    # 已有采纳都在 BEGIN IMMEDIATE 之后读取。若设置请求先提交，这里
+    # 等到锁后读到新参数，_recompute 按新参数求解，旧参数下的提案
+    # 会因不等于新提案（或无提案）被拒绝，不会把失效采纳写进库。
+    with db.get_write_conn() as conn:
         if db.get_project(conn, pid) is None:
             raise HTTPException(404, "项目不存在")
         cue_rows = list(db.get_cues(conn, pid))
@@ -259,14 +267,14 @@ def adopt(pid: int, body: AdoptIn):
 
 @app.delete("/api/projects/{pid}/adopt/{cue_uid}")
 def revert_adoption(pid: int, cue_uid: int):
-    with db.get_conn() as conn:
+    with db.get_write_conn() as conn:
         db.delete_adoption(conn, pid, cue_uid)
         return _recompute(conn, pid)
 
 
 @app.delete("/api/projects/{pid}")
 def remove_project(pid: int):
-    with db.get_conn() as conn:
+    with db.get_write_conn() as conn:
         db.delete_project(conn, pid)
     return {"ok": True}
 

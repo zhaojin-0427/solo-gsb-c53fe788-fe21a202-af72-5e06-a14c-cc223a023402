@@ -225,7 +225,16 @@ $("#cueTable").addEventListener("click", async (ev) => {
     }
     render();
     loadProjects();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    toast(e.message, true);
+    // 并发下参数可能刚被另一请求更新（本采纳按新参数被拒绝）：
+    // 重新拉取项目，让表格与统计条显示最新提案与采纳状态
+    try {
+      state.project = await api(`/api/projects/${pid}`);
+      render();
+      loadProjects();
+    } catch (_) {}
+  }
 });
 
 $("#adoptAllBtn").addEventListener("click", async () => {
@@ -249,7 +258,15 @@ $("#adoptAllBtn").addEventListener("click", async () => {
     toast(`已批量采纳 ${todo.length} 条`);
     render();
     loadProjects();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    toast(e.message, true);
+    // 批量中途被新参数拒绝时，刷新为服务端最新状态
+    try {
+      state.project = await api(`/api/projects/${state.project.id}`);
+      render();
+      loadProjects();
+    } catch (_) {}
+  }
 });
 
 $("#deleteProjectBtn").addEventListener("click", async () => {

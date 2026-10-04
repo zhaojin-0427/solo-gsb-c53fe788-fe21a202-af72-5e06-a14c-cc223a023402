@@ -51,16 +51,47 @@ def _connect() -> sqlite3.Connection:
     directory = os.path.dirname(DB_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    # isolation_level=None：事务边界完全由显式 BEGIN/COMMIT 控制，
+    # 避免 Python 层「首条写语句才隐式开启事务」把读快照排除在事务外。
+    # timeout：等待写锁的 busy 超时；BEGIN IMMEDIATE 在持锁方提交前阻塞等待，
+    # 等到锁之后读到的是对方已提交的最新状态。
+    conn = sqlite3.connect(DB_PATH, timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
 @contextmanager
 def get_conn() -> Iterator[sqlite3.Connection]:
+    """只读事务（BEGIN DEFERRED）：整个请求内的多条 SELECT 看到同一份
+    已提交快照，不会拼出「新参数 + 旧采纳」这类跨提交的混合状态。"""
     conn = _connect()
     try:
+        conn.execute("BEGIN")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@contextmanager
+def get_write_conn() -> Iterator[sqlite3.Connection]:
+    """读写事务（BEGIN IMMEDIATE）：进入即取写锁，此后的读取、校验与
+    落库都在同一事务内，基于同一份最新已提交状态。
+
+    两条写路径（PUT settings 与 POST adopt）都经由此进入，因而被写锁
+    串行化：后到者在 BEGIN 处等待，持锁方提交后它读到最新状态再继续——
+    采纳先提交则设置请求能在重核验中看到并撤销新参数下失效的采纳；
+    设置先提交则采纳请求按新参数重算提案并拒绝失效的旧提案。
+    任一步异常整体回滚，不留半更新。
+    """
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         yield conn
         conn.commit()
     except Exception:
@@ -71,7 +102,7 @@ def get_conn() -> Iterator[sqlite3.Connection]:
 
 
 def init_db() -> None:
-    with get_conn() as conn:
+    with get_write_conn() as conn:
         conn.executescript(_SCHEMA)
 
 
