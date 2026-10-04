@@ -163,6 +163,16 @@ function render() {
   $("#projectSelect").value = String(p.id);
 }
 
+// 采纳可能因另一标签页并发改参数而被拒（旧提案失效）：重新拉取详情，
+// 让表格与统计条回到服务端的最新一致状态。
+async function refreshAfterConflict(pid) {
+  try {
+    state.project = await api(`/api/projects/${pid}`);
+    render();
+    loadProjects();
+  } catch (_) {}
+}
+
 // ---------- 事件 ----------
 $("#importForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -225,7 +235,10 @@ $("#cueTable").addEventListener("click", async (ev) => {
     }
     render();
     loadProjects();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    toast(e.message + "（参数可能已在别处更新，已刷新）", true);
+    refreshAfterConflict(pid);
+  }
 });
 
 $("#adoptAllBtn").addEventListener("click", async () => {
@@ -249,7 +262,10 @@ $("#adoptAllBtn").addEventListener("click", async () => {
     toast(`已批量采纳 ${todo.length} 条`);
     render();
     loadProjects();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    toast(e.message + "（参数可能已在别处更新，已刷新）", true);
+    refreshAfterConflict(state.project.id);
+  }
 });
 
 $("#deleteProjectBtn").addEventListener("click", async () => {

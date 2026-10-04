@@ -7,6 +7,9 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 DB_PATH = os.environ.get("DATABASE_PATH", "/data/subtitle_station.db")
+# 并发写路径（参数更新 / 采纳）先抢写锁再读状态：等待持锁事务期间
+# 阻塞而不是立刻抛 SQLITE_BUSY。可用 BUSY_TIMEOUT_MS 覆盖。
+BUSY_TIMEOUT_MS = int(os.environ.get("BUSY_TIMEOUT_MS", "30000"))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -51,16 +54,34 @@ def _connect() -> sqlite3.Connection:
     directory = os.path.dirname(DB_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    # isolation_level=None：事务边界完全由本模块显式控制（见 get_conn），
+    # 不依赖 pysqlite 在第一条 DML 前隐式发 BEGIN——那会把读/求解留在
+    # 事务之外，并发写仍能按旧快照落库。
+    conn = sqlite3.connect(
+        DB_PATH, isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000.0
+    )
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 @contextmanager
-def get_conn() -> Iterator[sqlite3.Connection]:
+def get_conn(write: bool = False) -> Iterator[sqlite3.Connection]:
+    """提供一个事务边界明确的连接。
+
+    write=False：`BEGIN` 延迟事务，在一致快照上只读（项目详情 / 导出 /
+        列表），事务期间多次 SELECT 与随后的 build_analysis 不会被并发
+        写入撕开。
+    write=True：`BEGIN IMMEDIATE` 立刻取得 RESERVED 写锁后再读取任何
+        项目参数、字幕、镜头与采纳状态。两条写路径（PUT settings、
+        POST/DELETE adopt）由此串行：后到者阻塞等待先提交者，锁内读到
+        的必为最新已提交状态，参数读取 / 提案校验 / 采纳核验 / 落库
+        全部基于同一事务视图；任一步异常整体回滚，不留半更新。
+    """
     conn = _connect()
     try:
+        conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
         yield conn
         conn.commit()
     except Exception:
@@ -71,8 +92,11 @@ def get_conn() -> Iterator[sqlite3.Connection]:
 
 
 def init_db() -> None:
-    with get_conn() as conn:
+    conn = _connect()
+    try:
         conn.executescript(_SCHEMA)
+    finally:
+        conn.close()
 
 
 def create_project(

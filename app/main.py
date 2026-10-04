@@ -172,7 +172,7 @@ async def create_project(
     } for c in parsed]
     shots_payload = [{"ord": s.ord, "start_ms": s.start_ms,
                       "end_ms": s.end_ms} for s in shots]
-    with db.get_conn() as conn:
+    with db.get_conn(write=True) as conn:
         pid = db.create_project(conn, name, cps_limit, min_gap_ms,
                                 tolerance_ms, cues_payload, shots_payload)
         return _recompute(conn, pid)
@@ -188,7 +188,11 @@ def get_project(pid: int):
 def update_settings(pid: int, body: SettingsIn):
     if body.cps_limit <= 0 or body.min_gap_ms < 0 or body.tolerance_ms < 0:
         raise HTTPException(400, "参数非法")
-    with db.get_conn() as conn:
+    # 先取 RESERVED 写锁再读状态：与并发的 POST /adopt 互斥。若采纳
+    # 事务先提交，这里锁内读到的就是含新采纳的最新状态，revalidate
+    # 会撤销新参数下失效者；若本事务先拿到锁，采纳请求会阻塞到本事务
+    # 提交，随后按新参数重读并拒绝失效旧提案（见 adopt）。
+    with db.get_conn(write=True) as conn:
         prow = db.get_project(conn, pid)
         if prow is None:
             raise HTTPException(404, "项目不存在")
@@ -204,7 +208,7 @@ def update_settings(pid: int, body: SettingsIn):
                 raw_hash=r["raw_hash"],
             ) for r in cue_rows
         ]
-        # 同一事务内：先用新参数求提案（与详情/采纳校验完全同一套
+        # 同一写事务内：用新参数求提案（与详情/采纳校验完全同一套
         # build_analysis 规则）。失败则由 get_conn 整体回滚，参数与
         # 采纳状态都不会被改动。
         analysis = build_analysis(
@@ -233,7 +237,11 @@ def update_settings(pid: int, body: SettingsIn):
 
 @app.post("/api/projects/{pid}/adopt")
 def adopt(pid: int, body: AdoptIn):
-    with db.get_conn() as conn:
+    # 先取写锁再读取：若并发的 PUT settings 先提交，本请求会在 BEGIN
+    # IMMEDIATE 处等待，锁内重读时拿到的已是新参数，随后 _recompute
+    # 用新参数求提案——旧提案位置在此被判失效而拒绝（400），不会把按
+    # 旧参数算出的采纳值与新参数并存落库。
+    with db.get_conn(write=True) as conn:
         if db.get_project(conn, pid) is None:
             raise HTTPException(404, "项目不存在")
         cue_rows = list(db.get_cues(conn, pid))
@@ -243,7 +251,7 @@ def adopt(pid: int, body: AdoptIn):
         orig_dur = target["end_ms"] - target["start_ms"]
         if body.new_end_ms - body.new_start_ms != orig_dur:
             raise HTTPException(400, "校正仅允许平移：时长必须与原时长完全一致")
-        # 必须落在当前参数下的提案位置（重新计算并比对）
+        # 必须落在当前（锁内最新）参数下的提案位置（重新计算并比对）
         payload = _recompute(conn, pid)
         cand = next((c for c in payload["analysis"]["cues"]
                      if c["uid"] == body.cue_uid), None)
@@ -259,14 +267,14 @@ def adopt(pid: int, body: AdoptIn):
 
 @app.delete("/api/projects/{pid}/adopt/{cue_uid}")
 def revert_adoption(pid: int, cue_uid: int):
-    with db.get_conn() as conn:
+    with db.get_conn(write=True) as conn:
         db.delete_adoption(conn, pid, cue_uid)
         return _recompute(conn, pid)
 
 
 @app.delete("/api/projects/{pid}")
 def remove_project(pid: int):
-    with db.get_conn() as conn:
+    with db.get_conn(write=True) as conn:
         db.delete_project(conn, pid)
     return {"ok": True}
 
